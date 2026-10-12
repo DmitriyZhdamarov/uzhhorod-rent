@@ -1,0 +1,299 @@
+name: Uzhhorod rent monitor
+on:
+  schedule:
+    - cron: "23 * * * *"   # щогодини (час UTC)
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: monitor
+  cancel-in-progress: false
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Check listings
+        shell: python
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          """Моніторинг оренди квартир в Ужгороді -> Telegram.
+
+          Джерела:
+            - LUN.ua (агрегатор: містить оголошення OLX, DIM.RIA, rieltor.ua з оригінальними посиланнями)
+            - DIM.RIA напряму
+          Фільтри задаються нижче. Пам'ять про надіслані оголошення: seen.json у репозиторії.
+          """
+          import json, os, re, sys, time, urllib.request, urllib.parse
+          from datetime import datetime, timedelta, timezone
+
+          # ---------- КРИТЕРІЇ ----------
+          AREA_MIN, AREA_MAX = 34, 90          # м²
+          PRICE_MIN, PRICE_MAX = 500, 1000     # USD / місяць
+          ROOMS_MIN = 1
+          ONLY_TODAY = True                    # тільки опубліковані сьогодні (за київським часом)
+          MAX_PHOTOS = 3
+          # -------------------------------
+
+          KYIV = timezone(timedelta(hours=3))  # жовтень: EEST до 25.10, далі +2 (різниця некритична)
+          TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+          CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+          DRY_RUN = os.environ.get("DRY_RUN") == "1" or not TOKEN
+          SEEN_FILE = "seen.json"
+          UA = {
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                            "(KHTML, like Gecko) Chrome/128.0 Safari/537.36",
+              "Accept-Language": "uk-UA,uk;q=0.9",
+          }
+
+
+          def fetch(url, tries=3):
+              for a in range(tries):
+                  try:
+                      req = urllib.request.Request(url, headers=UA)
+                      with urllib.request.urlopen(req, timeout=40) as r:
+                          return r.read().decode("utf-8", "ignore")
+                  except Exception as e:
+                      print(f"  ! {url[:60]} attempt {a+1}: {e}")
+                      time.sleep(5)
+              return None
+
+
+          def nbu_rates():
+              rates = {"usd": 1.0, "uah": 1 / 41.5, "eur": 1.08}  # запасні значення
+              try:
+                  data = json.loads(fetch("https://bank.gov.ua/NBUStatService/v1/statdirectory/exchange?json") or "[]")
+                  r = {d["cc"].lower(): d["rate"] for d in data}
+                  rates = {"usd": 1.0, "uah": 1 / r["usd"], "eur": r["eur"] / r["usd"]}
+                  print(f"Курс НБУ: 1$={r['usd']:.2f} грн, 1€={rates['eur']:.3f}$")
+              except Exception as e:
+                  print("Курс НБУ недоступний, беру запасний:", e)
+              return rates
+
+
+          # ---------- LUN ----------
+          def lun_objects(html):
+              chunks = re.findall(r'self\.__next_f\.push\(\[1,"(.*?)"\]\)</script>', html, re.S)
+              txt = "".join(json.loads('"' + c + '"') for c in chunks)
+              for m in re.finditer(r'\{"id":(\d+),"groupId"', txt):
+                  i, depth, ins, esc = m.start(), 0, False, False
+                  for j in range(i, len(txt)):
+                      ch = txt[j]
+                      if ins:
+                          if esc: esc = False
+                          elif ch == "\\": esc = True
+                          elif ch == '"': ins = False
+                      elif ch == '"': ins = True
+                      elif ch == "{": depth += 1
+                      elif ch == "}":
+                          depth -= 1
+                          if depth == 0:
+                              try: yield json.loads(txt[i:j + 1])
+                              except Exception: pass
+                              break
+
+
+          def lun_district(o):
+              ents = o.get("geoEntities") or []
+              for t in ("district", "microdistrict", "neighborhood", "city_district"):
+                  for e in ents:
+                      if e.get("type") == t:
+                          return e["name"]
+              poi = (o.get("poi") or {}).get("name")
+              return poi or "Ужгород"
+
+
+          def lun_address(o):
+              ents = o.get("geoEntities") or []
+              street = next((e["name"] for e in ents if e.get("type") == "street"), "")
+              house = next((e["name"] for e in ents if e.get("type") == "house"), "")
+              return f"{street} {house}".strip()
+
+
+          def from_lun(rates):
+              out, seen_ids = [], set()
+              for url in ["https://lun.ua/rent/uz/flats", "https://lun.ua/rent/uz/flats?page=2"]:
+                  html = fetch(url)
+                  if not html:
+                      continue
+                  for o in lun_objects(html):
+                      if o["id"] in seen_ids:
+                          continue
+                      seen_ids.add(o["id"])
+                      cur = (o.get("currency") or "usd").lower()
+                      url_raw = o.get("urlRaw") or f"https://lun.ua/uk/realty/{o['id']}"
+                      dm = re.search(r"dom\.ria\.com/.*?-(\d{6,})\.html", url_raw)
+                      published = datetime.fromisoformat(o["insertTime"]).replace(tzinfo=timezone.utc).astimezone(KYIV)
+                      out.append({
+                          "keys": [f"lungroup:{o['groupId']}"] + ([f"domria:{dm.group(1)}"] if dm else []),
+                          "source": (o.get("site") or {}).get("displayName", "lun.ua") if isinstance(o.get("site"), dict) else (o.get("site") or "lun.ua"),
+                          "url": url_raw,
+                          "price_orig": f"{o['price']:,} {cur.upper()}".replace(",", " "),
+                          "price_usd": o["price"] * rates.get(cur, 1.0),
+                          "area": o.get("areaTotal"),
+                          "rooms": o.get("roomCount"),
+                          "district": lun_district(o),
+                          "address": lun_address(o),
+                          "published": published,
+                          "photos": [f"https://market-images.lunstatic.net/lun-ua/1200/1200/images/{im['imageId']}.jpg"
+                                     for im in (o.get("images") or [])[:MAX_PHOTOS]],
+                      })
+              print(f"LUN: {len(out)} оголошень")
+              return out
+
+
+          # ---------- DIM.RIA ----------
+          def from_domria(rates):
+              html = fetch("https://dom.ria.com/uk/arenda-kvartir/uzhgorod/")
+              out = []
+              if not html:
+                  print("DIM.RIA: недоступний")
+                  return out
+              i = html.find("__INITIAL_STATE__=")
+              try:
+                  state, _ = json.JSONDecoder().raw_decode(html[i + len("__INITIAL_STATE__="):])
+              except Exception as e:
+                  print("DIM.RIA: не вдалося розібрати сторінку:", e)
+                  return out
+              found = {}
+              def walk(o):
+                  if isinstance(o, dict):
+                      if "realty_id" in o and "currency_type" in o:
+                          found[o["realty_id"]] = o
+                          return
+                      for v in o.values(): walk(v)
+                  elif isinstance(o, list):
+                      for v in o: walk(v)
+              walk(state)
+              cur_map = {"$": "usd", "€": "eur", "грн": "uah"}
+              for rid, o in found.items():
+                  cur = cur_map.get(o.get("currency_type"), "usd")
+                  price_usd = o.get("priceUSD")
+                  try: price_usd = float(re.sub(r"[^\d.]", "", str(price_usd)))
+                  except Exception: price_usd = (o.get("price") or 0) * rates.get(cur, 1.0)
+                  photos = []
+                  for p in (o.get("photos") or {}).values() if isinstance(o.get("photos"), dict) else (o.get("photos") or []):
+                      fid = p.get("file") if isinstance(p, dict) else None
+                      if fid:
+                          photos.append("https://cdn.riastatic.com/photos/" + fid.replace(".jpg", "fm.jpg"))
+                  if not photos and o.get("main_photo"):
+                      photos = ["https://cdn.riastatic.com/photos/" + o["main_photo"].replace(".jpg", "fm.jpg")]
+                  try:
+                      published = datetime.strptime(o["publishing_date"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=KYIV)
+                  except Exception:
+                      continue
+                  out.append({
+                      "keys": [f"domria:{rid}"],
+                      "source": "dom.ria.com",
+                      "url": "https://dom.ria.com/uk/" + (o.get("beautiful_url") or f"{rid}.html"),
+                      "price_orig": f"{o.get('price')} {o.get('currency_type')}",
+                      "price_usd": price_usd,
+                      "area": o.get("total_square_meters"),
+                      "rooms": o.get("rooms_count"),
+                      "district": o.get("district_name_uk") or "",
+                      "address": o.get("street_name_uk") or "",
+                      "published": published,
+                      "photos": photos[:MAX_PHOTOS],
+                  })
+              print(f"DIM.RIA: {len(out)} оголошень")
+              return out
+
+
+          # ---------- ФІЛЬТР ----------
+          def matches(x, today):
+              if ONLY_TODAY and x["published"].date() != today:
+                  return False
+              if x["area"] is None or not (AREA_MIN <= float(x["area"]) <= AREA_MAX):
+                  return False
+              if not (PRICE_MIN <= x["price_usd"] <= PRICE_MAX):
+                  return False
+              if x["rooms"] is not None and int(x["rooms"]) < ROOMS_MIN:
+                  return False
+              return True
+
+
+          def fingerprint(x):
+              # той самий об'єкт на різних сайтах: площа + ціна (з округленням)
+              return f"fp:{round(float(x['area']))}:{round(x['price_usd'] / 25) * 25}"
+
+
+          # ---------- TELEGRAM ----------
+          def tg(method, payload):
+              data = urllib.parse.urlencode(payload).encode()
+              req = urllib.request.Request(f"https://api.telegram.org/bot{TOKEN}/{method}", data=data)
+              with urllib.request.urlopen(req, timeout=40) as r:
+                  return json.loads(r.read())
+
+
+          def caption(x):
+              rooms = f"{x['rooms']}-кімн." if x["rooms"] else "кімн. ?"
+              usd = f" (~${x['price_usd']:.0f})" if not x["price_orig"].endswith(("USD", "$")) else ""
+              return (f"🏠 <b>{x['price_orig']}</b>{usd}\n"
+                      f"{rooms} · {x['area']} м²\n"
+                      f"📍 {x['district']}{' · ' + x['address'] if x['address'] and x['address'] != x['district'] else ''}\n"
+                      f"🕒 {x['published']:%d.%m %H:%M} · {x['source']}\n"
+                      f'<a href="{x["url"]}">Відкрити оголошення</a>')
+
+
+          def send(x):
+              text = caption(x)
+              if DRY_RUN:
+                  print("---- [тест, не надсилаю] ----\n" + text + "\n" + "\n".join(x["photos"]))
+                  return True
+              if x["photos"]:
+                  media = [{"type": "photo", "media": p} for p in x["photos"]]
+                  media[0].update(caption=text, parse_mode="HTML")
+                  try:
+                      tg("sendMediaGroup", {"chat_id": CHAT_ID, "media": json.dumps(media)})
+                      return True
+                  except Exception as e:
+                      print("  фото не пройшли, надсилаю текстом:", e)
+              try:
+                  tg("sendMessage", {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML",
+                                     "disable_web_page_preview": "false"})
+                  return True
+              except Exception as e:
+                  print("  ПОМИЛКА Telegram:", e)
+                  return False
+
+
+          # ---------- MAIN ----------
+          def main():
+              try: seen = set(json.load(open(SEEN_FILE)))
+              except Exception: seen = set()
+              rates = nbu_rates()
+              items = from_domria(rates) + from_lun(rates)
+              today = datetime.now(KYIV).date()
+              new, sent = [], 0
+              for x in sorted(items, key=lambda x: x["published"]):
+                  if not matches(x, today):
+                      continue
+                  keys = x["keys"] + [fingerprint(x)]
+                  if any(k in seen for k in keys):
+                      continue
+                  seen.update(keys)
+                  new.append(x)
+              print(f"Нових підходящих: {len(new)}")
+              for x in new:
+                  if send(x): sent += 1
+                  time.sleep(2)
+              json.dump(sorted(seen), open(SEEN_FILE, "w"), ensure_ascii=False, indent=0)
+              print(f"Надіслано: {sent}")
+
+
+          if __name__ == "__main__":
+              main()
+      - name: Save memory of sent listings
+        run: |
+          if [ -n "$(git status --porcelain seen.json)" ]; then
+            git config user.name "rent-bot"
+            git config user.email "rent-bot@users.noreply.github.com"
+            git add seen.json
+            git commit -m "update seen listings"
+            git push
+          fi
