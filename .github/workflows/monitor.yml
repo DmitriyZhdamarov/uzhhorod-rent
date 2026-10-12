@@ -44,7 +44,7 @@ jobs:
           TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
           CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
           DRY_RUN = os.environ.get("DRY_RUN") == "1" or not TOKEN
-          SEEN_FILE = "seen.json"
+          SEEN_FILE = "sent.json"
           UA = {
               "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                             "(KHTML, like Gecko) Chrome/128.0 Safari/537.36",
@@ -226,8 +226,11 @@ jobs:
           def tg(method, payload):
               data = urllib.parse.urlencode(payload).encode()
               req = urllib.request.Request(f"https://api.telegram.org/bot{TOKEN}/{method}", data=data)
-              with urllib.request.urlopen(req, timeout=40) as r:
-                  return json.loads(r.read())
+              try:
+                  with urllib.request.urlopen(req, timeout=40) as r:
+                      return json.loads(r.read())
+              except urllib.error.HTTPError as e:
+                  raise RuntimeError(f"{e.code}: {e.read().decode('utf-8', 'ignore')[:300]}")
 
 
           def caption(x):
@@ -269,18 +272,20 @@ jobs:
               rates = nbu_rates()
               items = from_domria(rates) + from_lun(rates)
               today = datetime.now(KYIV).date()
-              new, sent = [], 0
+              new, sent, batch = [], 0, set()
               for x in sorted(items, key=lambda x: x["published"]):
                   if not matches(x, today):
                       continue
                   keys = x["keys"] + [fingerprint(x)]
-                  if any(k in seen for k in keys):
+                  if any(k in seen or k in batch for k in keys):
                       continue
-                  seen.update(keys)
-                  new.append(x)
+                  batch.update(keys)
+                  new.append((x, keys))
               print(f"Нових підходящих: {len(new)}")
-              for x in new:
-                  if send(x): sent += 1
+              for x, keys in new:
+                  if send(x):
+                      sent += 1
+                      seen.update(keys)
                   time.sleep(2)
               json.dump(sorted(seen), open(SEEN_FILE, "w"), ensure_ascii=False, indent=0)
               print(f"Надіслано: {sent}")
@@ -290,10 +295,10 @@ jobs:
               main()
       - name: Save memory of sent listings
         run: |
-          if [ -n "$(git status --porcelain seen.json)" ]; then
+          if [ -n "$(git status --porcelain sent.json)" ]; then
             git config user.name "rent-bot"
             git config user.email "rent-bot@users.noreply.github.com"
-            git add seen.json
+            git add sent.json
             git commit -m "update seen listings"
             git push
           fi
