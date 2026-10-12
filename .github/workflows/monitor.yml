@@ -1,7 +1,7 @@
 name: Uzhhorod rent monitor
 on:
   schedule:
-    - cron: "23 * * * *"   # щогодини (час UTC)
+    - cron: "8,38 * * * *"   # кожні 30 хвилин
   workflow_dispatch:
 permissions:
   contents: write
@@ -27,7 +27,7 @@ jobs:
           Джерела:
             - LUN.ua (агрегатор: містить оголошення OLX, DIM.RIA, rieltor.ua з оригінальними посиланнями)
             - DIM.RIA напряму
-          Фільтри задаються нижче. Пам'ять про надіслані оголошення: seen.json у репозиторії.
+          Фільтри задаються нижче. Пам'ять про надіслані оголошення: sent.json у репозиторії.
           """
           import json, os, re, sys, time, urllib.request, urllib.parse
           from datetime import datetime, timedelta, timezone
@@ -299,6 +299,10 @@ jobs:
             git config user.name "rent-bot"
             git config user.email "rent-bot@users.noreply.github.com"
             git add sent.json
-            git commit -m "update seen listings"
-            git push
+            git commit -m "update sent listings"
+            for i in 1 2 3; do
+              git pull --rebase -X theirs origin main && git push && exit 0
+              sleep 5
+            done
+            exit 1
           fi
