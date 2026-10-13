@@ -1,7 +1,7 @@
 name: Uzhhorod rent monitor
 on:
   schedule:
-    - cron: "8,38 * * * *"   # кожні 30 хвилин
+    - cron: "47 */2 * * *"   # запасний запуск раз на 2 год; основний — cron-job.org
   workflow_dispatch:
 permissions:
   contents: write
@@ -27,7 +27,7 @@ jobs:
           Джерела:
             - LUN.ua (агрегатор: містить оголошення OLX, DIM.RIA, rieltor.ua з оригінальними посиланнями)
             - DIM.RIA напряму
-          Фільтри задаються нижче. Пам'ять про надіслані оголошення: sent.json у репозиторії.
+          Фільтри задаються нижче. Пам'ять про надіслані оголошення: seen.json у репозиторії.
           """
           import json, os, re, sys, time, urllib.request, urllib.parse
           from datetime import datetime, timedelta, timezone
@@ -36,7 +36,7 @@ jobs:
           AREA_MIN, AREA_MAX = 34, 90          # м²
           PRICE_MIN, PRICE_MAX = 500, 1000     # USD / місяць
           ROOMS_MIN = 1
-          ONLY_TODAY = True                    # тільки опубліковані сьогодні (за київським часом)
+          MAX_AGE_HOURS = 24                   # тільки опубліковані за останні 24 години
           MAX_PHOTOS = 3
           # -------------------------------
 
@@ -205,8 +205,8 @@ jobs:
 
 
           # ---------- ФІЛЬТР ----------
-          def matches(x, today):
-              if ONLY_TODAY and x["published"].date() != today:
+          def matches(x, now):
+              if now - x["published"] > timedelta(hours=MAX_AGE_HOURS):
                   return False
               if x["area"] is None or not (AREA_MIN <= float(x["area"]) <= AREA_MAX):
                   return False
@@ -271,10 +271,10 @@ jobs:
               except Exception: seen = set()
               rates = nbu_rates()
               items = from_domria(rates) + from_lun(rates)
-              today = datetime.now(KYIV).date()
+              now = datetime.now(timezone.utc)
               new, sent, batch = [], 0, set()
               for x in sorted(items, key=lambda x: x["published"]):
-                  if not matches(x, today):
+                  if not matches(x, now):
                       continue
                   keys = x["keys"] + [fingerprint(x)]
                   if any(k in seen or k in batch for k in keys):
